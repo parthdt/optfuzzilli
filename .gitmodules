@@ -1,0 +1,3 @@
+[submodule "fuzzilli"]
+	path = fuzzilli
+	url = git@github.com:parthdt/fuzzilli.git
