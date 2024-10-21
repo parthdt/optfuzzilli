@@ -1,5 +1,5 @@
 [package]
-name = "optimize_fzil"
+name = "libafl_fuzzilli"
 version = "0.1.0"
 edition = "2021"
 
@@ -20,7 +20,7 @@ debug = true
 
 [lib]
 crate-type = ["cdylib"]
-name = "optimize_fzil"
+name = "libafl_fuzzilli"
 
 [[bin]]
 # This can be whatever name makes sense for your project, but the rest of this tutorial assumes uniffi-bindgen.
