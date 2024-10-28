@@ -27,7 +27,7 @@ use libafl::{
     observers::StdMapObserver,
     schedulers::{QueueScheduler, Scheduler},
     stages::mutational::StdMutationalStage,
-    state::{StdState,HasCorpus,State},
+    state::{StdState,HasCorpus,State, UsesState},
 };
 
 use libafl_bolts::{current_nanos, rands::StdRand, tuples::tuple_list, AsSlice};
@@ -159,6 +159,81 @@ impl FzilOnDiskCorpusBytes {
         self.get_element(random_index)
     }
     
+}
+
+/// Walk the corpus in a queue-like fashion
+#[derive(Debug, Clone)]
+pub struct MyScheduler<S> {
+    queue_cycles: u64,
+    runs_in_current_cycle: u64,
+    phantom: PhantomData<S>,
+}
+
+impl<S> UsesState for MyScheduler<S>
+where
+    S: State,
+{
+    type State = S;
+}
+
+#[uniffi::export]
+pub trait TempUsesInput {
+    /// Type which will be used throughout this state.
+    type Input: Input;
+}
+
+impl<S> Scheduler for MyScheduler<S>
+where
+    S: HasCorpus + HasTestcase + State,
+{
+    fn on_add(&mut self, state: &mut Self::State, id: CorpusId) -> Result<(), Error> {
+        // Set parent id
+        let current_id = *state.corpus().current();
+        state
+            .corpus()
+            .get(id)?
+            .borrow_mut()
+            .set_parent_id_optional(current_id);
+
+        Ok(())
+    }
+
+    /// Gets the next entry in the queue
+    fn next(&mut self, state: &mut Self::State) -> Result<CorpusId, Error> {
+        if state.corpus().count() == 0 {
+            Err(Error::empty(
+                "No entries in corpus. This often implies the target is not properly instrumented."
+                    .to_owned(),
+            ))
+        } else {
+            let id = state
+                .corpus()
+                .current()
+                .map(|id| state.corpus().next(id))
+                .flatten()
+                .unwrap_or_else(|| state.corpus().first().unwrap());
+
+            self.runs_in_current_cycle += 1;
+            // TODO deal with corpus_counts decreasing due to removals
+            if self.runs_in_current_cycle >= state.corpus().count() as u64 {
+                self.queue_cycles += 1;
+            }
+            self.set_current_scheduled(state, Some(id))?;
+            Ok(id)
+        }
+    }
+}
+
+impl<S> MyScheduler<S> {
+    /// Creates a new `QueueScheduler`
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            runs_in_current_cycle: 0,
+            queue_cycles: 0,
+            phantom: PhantomData,
+        }
+    }
 }
 
 uniffi::setup_scaffolding!();
