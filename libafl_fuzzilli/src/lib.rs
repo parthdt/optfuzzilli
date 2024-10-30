@@ -19,7 +19,7 @@ use libafl::{
     corpus::{Corpus, CorpusId, InMemoryCorpus, Testcase, HasTestcase, OnDiskCorpus},
     events::SimpleEventManager,
     executors::{inprocess::InProcessExecutor, ExitKind},
-    feedbacks::{CrashFeedback, MaxMapFeedback},
+    feedbacks::{CrashFeedback, ConstFeedback, MaxMapFeedback},
     fuzzer::{Fuzzer, StdFuzzer},
     generators::RandPrintablesGenerator,
     inputs::{BytesInput, HasTargetBytes, HasMutatorBytes, Input},
@@ -48,7 +48,7 @@ where
     inner: OnDiskCorpus<I>,
 }
 
-// Implement Send and Sync for FzilInMemoryCorpus
+// Implement Send and Sync for FzilOnDiskCorpus
 unsafe impl<I: Input + Send + Sync> Send for FzilOnDiskCorpus<I> {}
 unsafe impl<I: Input + Send + Sync> Sync for FzilOnDiskCorpus<I> {}
 
@@ -58,7 +58,7 @@ pub struct FzilOnDiskCorpusBytes {
     inner: Arc<Mutex<FzilOnDiskCorpus<BytesInput>>>,
 }
 
-// Implementation for FzilInMemoryCorpusBytes
+// Implementation for FzilOnDiskCorpusBytes
 #[uniffi::export]
 impl FzilOnDiskCorpusBytes {
     #[uniffi::constructor]
@@ -161,78 +161,70 @@ impl FzilOnDiskCorpusBytes {
     
 }
 
-/// Walk the corpus in a queue-like fashion
-#[derive(Debug, Clone)]
-pub struct MyScheduler<S> {
-    queue_cycles: u64,
-    runs_in_current_cycle: u64,
-    phantom: PhantomData<S>,
+#[derive(uniffi::Object, Debug)]
+pub struct MyFzilScheduler {
+    inner: Arc<Mutex<QueueScheduler<StdState<BytesInput, OnDiskCorpus<BytesInput>, StdRand, OnDiskCorpus<BytesInput>>>>>,
+    state: Arc<Mutex<StdState<BytesInput, OnDiskCorpus<BytesInput>, StdRand, OnDiskCorpus<BytesInput>>>>,
 }
 
-impl<S> UsesState for MyScheduler<S>
-where
-    S: State,
-{
-    type State = S;
-}
+unsafe impl Send for MyFzilScheduler {}
+unsafe impl Sync for MyFzilScheduler {}
 
 #[uniffi::export]
-pub trait TempUsesInput {
-    /// Type which will be used throughout this state.
-    type Input: Input;
-}
+impl MyFzilScheduler {
+    // Constructor to create a new QueueScheduler with StdState
+    #[uniffi::constructor]
+    pub fn new() -> Arc<MyFzilScheduler> {
+        let rand = StdRand::with_seed(current_nanos());
+        let corpus1 = OnDiskCorpus::new(PathBuf::from("./pcorpus")).unwrap();
+        let corpus2 = OnDiskCorpus::new(PathBuf::from("./ocorpus")).unwrap();
+        
+        let state = StdState::new(
+            rand,
+            corpus1,
+            corpus2,
+            &mut ConstFeedback::new(false),
+            &mut ConstFeedback::new(false),
+        ).unwrap();
 
-impl<S> Scheduler for MyScheduler<S>
-where
-    S: HasCorpus + HasTestcase + State,
-{
-    fn on_add(&mut self, state: &mut Self::State, id: CorpusId) -> Result<(), Error> {
-        // Set parent id
-        let current_id = *state.corpus().current();
-        state
-            .corpus()
-            .get(id)?
-            .borrow_mut()
-            .set_parent_id_optional(current_id);
+        let scheduler = QueueScheduler::new();
 
-        Ok(())
+        Arc::new(MyFzilScheduler {
+            inner: Arc::new(Mutex::new(scheduler)),
+            state: Arc::new(Mutex::new(state)),
+        })
     }
 
-    /// Gets the next entry in the queue
-    fn next(&mut self, state: &mut Self::State) -> Result<CorpusId, Error> {
-        if state.corpus().count() == 0 {
-            Err(Error::empty(
-                "No entries in corpus. This often implies the target is not properly instrumented."
-                    .to_owned(),
-            ))
-        } else {
-            let id = state
-                .corpus()
-                .current()
-                .map(|id| state.corpus().next(id))
-                .flatten()
-                .unwrap_or_else(|| state.corpus().first().unwrap());
-
-            self.runs_in_current_cycle += 1;
-            // TODO deal with corpus_counts decreasing due to removals
-            if self.runs_in_current_cycle >= state.corpus().count() as u64 {
-                self.queue_cycles += 1;
-            }
-            self.set_current_scheduled(state, Some(id))?;
-            Ok(id)
-        }
+    // Add an input to the corpus
+    pub fn add_input(&self, input_data: Vec<u8>) {
+        let input = BytesInput::new(input_data);
+        let testcase = Testcase::new(input);
+        let mut state = self.state.lock().unwrap();
+        state.corpus_mut().add(testcase).unwrap();
     }
-}
 
-impl<S> MyScheduler<S> {
-    /// Creates a new `QueueScheduler`
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            runs_in_current_cycle: 0,
-            queue_cycles: 0,
-            phantom: PhantomData,
-        }
+    // Get the current test case in the scheduler, returns Vec<u8>
+    pub fn current_testcase(&self) -> Vec<u8> {
+        let state = self.state.lock().unwrap();
+        let current_id = state.corpus().current().unwrap();
+
+        // Retrieve the testcase from the corpus using current_id
+        let testcase = state.corpus().get(current_id).unwrap();
+        let testcase_borrowed = testcase.borrow();  // Borrow the testcase
+        let input = testcase_borrowed.input().as_ref().unwrap();
+        input.bytes().to_vec()  // Return as Vec<u8>
+    }
+
+    // Get the next input from the scheduler, returns Vec<u8>
+    pub fn next_input(&self) -> Vec<u8> {
+        let mut scheduler = self.inner.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
+        let next_id = scheduler.next(&mut *state).unwrap();
+
+        let testcase = state.corpus().get(next_id).unwrap();  // Get the testcase
+        let testcase_borrowed = testcase.borrow();  // Borrow the testcase
+        let input = testcase_borrowed.input().as_ref().unwrap();
+        input.bytes().to_vec()  // Return as Vec<u8>
     }
 }
 
