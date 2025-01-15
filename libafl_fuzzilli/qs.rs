@@ -3,145 +3,66 @@
 use std::sync::{Arc, Mutex};
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus, Testcase, Corpus, CorpusId},
-    feedbacks::{MaxMapFeedback, DifferentIsNovel, MapFeedback},
+    feedbacks::MaxMapFeedback,
     inputs::{BytesInput, HasMutatorBytes},
-    observers::{CanTrack, MapObserver, ExplicitTracking},
-    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler, Scheduler},
+    observers::{StdMapObserver, HitcountsMapObserver},
+    schedulers::{QueueScheduler, Scheduler},
     state::{StdState, HasCorpus},
 };
 use libafl_bolts::{
     rands::RomuDuoJrRand,
     shmem::{MmapShMem, MmapShMemProvider, ShMemProvider, ShMemId},
-    Named, HasLen, AsSliceMut,
+    AsSliceMut,
 };
-use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
-use std::hash::{Hasher, Hash};
 
 #[derive(uniffi::Object, Debug)]
 pub struct LibAflObject {
     state: Arc<Mutex<StdState<BytesInput, OnDiskCorpus<BytesInput>, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
-    scheduler: Arc<Mutex<IndexesLenTimeMinimizerScheduler<QueueScheduler, ExplicitTracking<FuzzilliCoverageObserver<'static>, true, false>>>>,
+    scheduler: Arc<Mutex<QueueScheduler>>,
+    observer: Arc<Mutex<HitcountsMapObserver<StdMapObserver<'static, u8, false>>>>,
+    feedback: Arc<Mutex<MaxMapFeedback<HitcountsMapObserver<StdMapObserver<'static, u8, false>>, HitcountsMapObserver<StdMapObserver<'static, u8, false>>>>>,
     _shmem: Arc<Mutex<MmapShMem>>, // Keep shared memory alive
 }
 
 unsafe impl Send for LibAflObject {}
 unsafe impl Sync for LibAflObject {}
 
-/// Custom observer for Fuzzilli's shared memory layout.
-#[derive(Debug, Serialize, Deserialize, Hash)]
-pub struct FuzzilliCoverageObserver<'a> {
-    name: Cow<'static, str>,
-    #[serde(skip)]
-    map: &'a mut [u8],
-    initial: u8,
-}
-
-impl<'a> FuzzilliCoverageObserver<'a> {
-    pub fn new(name: &'static str, map: &'a mut [u8]) -> Self {
-        Self {
-            name: Cow::from(name),
-            map,
-            initial: 0,
-        }
-    }
-}
-
-impl<'a> Named for FuzzilliCoverageObserver<'a> {
-    fn name(&self) -> &Cow<'static, str> {
-        &self.name
-    }
-}
-
-impl<'a> HasLen for FuzzilliCoverageObserver<'a> {
-    fn len(&self) -> usize {
-        self.map.len()
-    }
-}
-
-impl<'a> AsRef<Self> for FuzzilliCoverageObserver<'a> {
-    fn as_ref(&self) -> &Self {
-        self
-    }
-}
-
-impl<'a> AsMut<Self> for FuzzilliCoverageObserver<'a> {
-    fn as_mut(&mut self) -> &mut Self {
-        self
-    }
-}
-
-impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
-    type Entry = u8;
-
-    fn get(&self, idx: usize) -> Self::Entry {
-        self.map[idx]
-    }
-
-    fn set(&mut self, idx: usize, value: Self::Entry) {
-        self.map[idx] = value;
-    }
-
-    fn usable_count(&self) -> usize {
-        self.map.len()
-    }
-
-    fn count_bytes(&self) -> u64 {
-        self.map.iter().map(|&x| x as u64).sum()
-    }
-
-    fn hash_simple(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.map.hash(&mut hasher);
-        hasher.finish()
-    }
-
-    fn reset_map(&mut self) -> Result<(), libafl::Error> {
-        self.map.fill(self.initial);
-        Ok(())
-    }
-
-    fn initial(&self) -> Self::Entry {
-        self.initial
-    }
-
-    fn to_vec(&self) -> Vec<Self::Entry> {
-        self.map.to_vec()
-    }
-
-    fn how_many_set(&self, indices: &[usize]) -> usize {
-        indices.iter().filter(|&&idx| self.map[idx] > 0).count()
-    }
-}
-
 #[uniffi::export]
 impl LibAflObject {
     #[uniffi::constructor]
     pub fn new(corpus_dir: String, shmem_key: String) -> Arc<Self> {
+        // Initialize shared memory provider
         let mut shmem_provider = MmapShMemProvider::new().expect("Failed to create shared memory provider");
         let shmem_id = ShMemId::from_string(&shmem_key);
         let shmem = shmem_provider
             .shmem_from_id_and_size(shmem_id, 0x200000)
             .expect("Failed to attach to shared memory");
 
+        // Wrap shared memory in Arc<Mutex>
         let shmem_arc = Arc::new(Mutex::new(shmem));
 
+        // Get a mutable slice of the shared memory
         let shared_mem_slice: &'static mut [u8] = {
             let mut shmem_locked = shmem_arc.lock().unwrap();
             unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(shmem_locked.as_slice_mut()) }
         };
 
-        let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_slice);
-        let observer = raw_observer.track_indices();
+        // Create observer
+        let std_observer = unsafe { StdMapObserver::new("shared_mem", shared_mem_slice) };
+        let hitcounts_observer = HitcountsMapObserver::new(std_observer);
 
+        // Initialize corpus
         let on_disk_corpus = OnDiskCorpus::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
         let in_memory_corpus = InMemoryCorpus::new();
 
-        let rng = RomuDuoJrRand::with_seed(12345);
+        // Initialize random generator
+        let rng = RomuDuoJrRand::with_seed(12345); // Use a compatible random generator
 
-        let mut feedback = MaxMapFeedback::new(&observer);
-        let mut objective_feedback = MaxMapFeedback::new(&observer);
+        // Initialize feedbacks
+        let mut feedback = MaxMapFeedback::new(&hitcounts_observer);
+        let mut objective_feedback = MaxMapFeedback::new(&hitcounts_observer);
 
+        // Initialize state
         let state = StdState::new(
             rng,
             on_disk_corpus,
@@ -151,11 +72,14 @@ impl LibAflObject {
         )
         .expect("Failed to initialize StdState");
 
-        let scheduler = IndexesLenTimeMinimizerScheduler::new(&observer, QueueScheduler::new());
+        // Initialize scheduler
+        let scheduler = QueueScheduler::new();
 
         Arc::new(Self {
             state: Arc::new(Mutex::new(state)),
             scheduler: Arc::new(Mutex::new(scheduler)),
+            observer: Arc::new(Mutex::new(hitcounts_observer)),
+            feedback: Arc::new(Mutex::new(feedback)),
             _shmem: shmem_arc,
         })
     }
@@ -168,11 +92,14 @@ impl LibAflObject {
         state.corpus_mut().add(testcase).expect("Failed to add testcase to corpus");
     }
 
-
+    /// Suggest the next input for fuzzing.
     pub fn suggest_next_input(&self) -> Vec<u8> {
         let mut scheduler = self.scheduler.lock().unwrap();
         let mut state = self.state.lock().unwrap();
-        let next_id = scheduler.next(&mut *state).expect("Failed to fetch next input ID");
+        let next_id = <QueueScheduler as Scheduler<
+            BytesInput,
+            StdState<BytesInput, OnDiskCorpus<BytesInput>, RomuDuoJrRand, InMemoryCorpus<BytesInput>>,
+        >>::next(&mut *scheduler, &mut *state).expect("Failed to fetch next input ID");
         let testcase = state.corpus().get(next_id).unwrap();
         let borrowed = testcase.borrow();
         let input = borrowed.input().as_ref().unwrap();
@@ -214,6 +141,8 @@ impl LibAflObject {
             Err(_) => Vec::new(),
         }
     }
+
 }
 
 uniffi::setup_scaffolding!();
+
