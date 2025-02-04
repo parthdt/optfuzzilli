@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus, Testcase, Corpus, CorpusId},
-    feedbacks::MaxMapFeedback,
-    inputs::{BytesInput, HasMutatorBytes},
+    feedbacks::{MaxMapFeedback, ConstFeedback},
+    inputs::{BytesInput, HasMutatorBytes, ValueInput},
     observers::{StdMapObserver, HitcountsMapObserver},
     schedulers::{QueueScheduler, Scheduler},
     state::{StdState, HasCorpus},
@@ -17,11 +17,8 @@ use libafl_bolts::{
 
 #[derive(uniffi::Object, Debug)]
 pub struct LibAflObject {
-    state: Arc<Mutex<StdState<BytesInput, OnDiskCorpus<BytesInput>, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
+    state: Arc<Mutex<StdState<OnDiskCorpus<BytesInput>, BytesInput, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
     scheduler: Arc<Mutex<QueueScheduler>>,
-    observer: Arc<Mutex<HitcountsMapObserver<StdMapObserver<'static, u8, false>>>>,
-    feedback: Arc<Mutex<MaxMapFeedback<HitcountsMapObserver<StdMapObserver<'static, u8, false>>, HitcountsMapObserver<StdMapObserver<'static, u8, false>>>>>,
-    _shmem: Arc<Mutex<MmapShMem>>, // Keep shared memory alive
 }
 
 unsafe impl Send for LibAflObject {}
@@ -30,37 +27,17 @@ unsafe impl Sync for LibAflObject {}
 #[uniffi::export]
 impl LibAflObject {
     #[uniffi::constructor]
-    pub fn new(corpus_dir: String, shmem_key: String) -> Arc<Self> {
-        // Initialize shared memory provider
-        let mut shmem_provider = MmapShMemProvider::new().expect("Failed to create shared memory provider");
-        let shmem_id = ShMemId::from_string(&shmem_key);
-        let shmem = shmem_provider
-            .shmem_from_id_and_size(shmem_id, 0x200000)
-            .expect("Failed to attach to shared memory");
-
-        // Wrap shared memory in Arc<Mutex>
-        let shmem_arc = Arc::new(Mutex::new(shmem));
-
-        // Get a mutable slice of the shared memory
-        let shared_mem_slice: &'static mut [u8] = {
-            let mut shmem_locked = shmem_arc.lock().unwrap();
-            unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(shmem_locked.as_slice_mut()) }
-        };
-
-        // Create observer
-        let std_observer = unsafe { StdMapObserver::new("shared_mem", shared_mem_slice) };
-        let hitcounts_observer = HitcountsMapObserver::new(std_observer);
-
+    pub fn new(corpus_dir: String) -> Arc<Self> {
         // Initialize corpus
-        let on_disk_corpus = OnDiskCorpus::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
-        let in_memory_corpus = InMemoryCorpus::new();
+        let on_disk_corpus = OnDiskCorpus::<BytesInput>::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
+        let in_memory_corpus = InMemoryCorpus::<BytesInput>::new();
 
         // Initialize random generator
-        let rng = RomuDuoJrRand::with_seed(12345); // Use a compatible random generator
+        let rng = RomuDuoJrRand::with_seed(1337); // Use a compatible random generator
 
         // Initialize feedbacks
-        let mut feedback = MaxMapFeedback::new(&hitcounts_observer);
-        let mut objective_feedback = MaxMapFeedback::new(&hitcounts_observer);
+        let mut feedback = ConstFeedback::new(false);
+        let mut objective = ConstFeedback::new(false);
 
         // Initialize state
         let state = StdState::new(
@@ -68,7 +45,7 @@ impl LibAflObject {
             on_disk_corpus,
             in_memory_corpus,
             &mut feedback,
-            &mut objective_feedback,
+            &mut objective,
         )
         .expect("Failed to initialize StdState");
 
@@ -78,9 +55,6 @@ impl LibAflObject {
         Arc::new(Self {
             state: Arc::new(Mutex::new(state)),
             scheduler: Arc::new(Mutex::new(scheduler)),
-            observer: Arc::new(Mutex::new(hitcounts_observer)),
-            feedback: Arc::new(Mutex::new(feedback)),
-            _shmem: shmem_arc,
         })
     }
 
@@ -96,14 +70,11 @@ impl LibAflObject {
     pub fn suggest_next_input(&self) -> Vec<u8> {
         let mut scheduler = self.scheduler.lock().unwrap();
         let mut state = self.state.lock().unwrap();
-        let next_id = <QueueScheduler as Scheduler<
-            BytesInput,
-            StdState<BytesInput, OnDiskCorpus<BytesInput>, RomuDuoJrRand, InMemoryCorpus<BytesInput>>,
-        >>::next(&mut *scheduler, &mut *state).expect("Failed to fetch next input ID");
+        let next_id = scheduler.next(&mut *state).expect("Failed to fetch next input ID");
         let testcase = state.corpus().get(next_id).unwrap();
         let borrowed = testcase.borrow();
         let input = borrowed.input().as_ref().unwrap();
-        input.bytes().to_vec()
+        input.mutator_bytes().to_vec()
     }
 
     pub fn count(&self) -> u64 {
@@ -133,7 +104,7 @@ impl LibAflObject {
         match state.corpus().get(corpus_id) {
             Ok(testcase) => {
                 if let Some(input) = testcase.borrow().input() {
-                    input.bytes().to_vec()
+                    input.mutator_bytes().to_vec()
                 } else {
                     Vec::new()
                 }
@@ -145,4 +116,3 @@ impl LibAflObject {
 }
 
 uniffi::setup_scaffolding!();
-
