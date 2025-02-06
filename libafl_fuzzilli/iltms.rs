@@ -20,8 +20,8 @@ use std::hash::{Hasher, Hash};
 
 #[derive(uniffi::Object, Debug)]
 pub struct LibAflObject {
-    state: Arc<Mutex<StdState<BytesInput, OnDiskCorpus<BytesInput>, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
-    scheduler: Arc<Mutex<IndexesLenTimeMinimizerScheduler<QueueScheduler, ExplicitTracking<FuzzilliCoverageObserver<'static>, true, false>>>>,
+    state: Arc<Mutex<StdState<OnDiskCorpus<BytesInput>, BytesInput, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
+    scheduler: Arc<Mutex<IndexesLenTimeMinimizerScheduler<QueueScheduler, BytesInput, ExplicitTracking<FuzzilliCoverageObserver<'static>, true, false>>>>,
     _shmem: Arc<Mutex<MmapShMem>>, // Keep shared memory alive
 }
 
@@ -90,12 +90,6 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
         self.map.iter().map(|&x| x as u64).sum()
     }
 
-    fn hash_simple(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.map.hash(&mut hasher);
-        hasher.finish()
-    }
-
     fn reset_map(&mut self) -> Result<(), libafl::Error> {
         self.map.fill(self.initial);
         Ok(())
@@ -134,8 +128,8 @@ impl LibAflObject {
         let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_slice);
         let observer = raw_observer.track_indices();
 
-        let on_disk_corpus = OnDiskCorpus::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
-        let in_memory_corpus = InMemoryCorpus::new();
+        let on_disk_corpus = OnDiskCorpus::<BytesInput>::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
+        let in_memory_corpus = InMemoryCorpus::<BytesInput>::new();
 
         let rng = RomuDuoJrRand::with_seed(12345);
 
@@ -176,7 +170,7 @@ impl LibAflObject {
         let testcase = state.corpus().get(next_id).unwrap();
         let borrowed = testcase.borrow();
         let input = borrowed.input().as_ref().unwrap();
-        input.bytes().to_vec()
+        input. mutator_bytes().to_vec()
     }
 
     pub fn count(&self) -> u64 {
@@ -206,7 +200,7 @@ impl LibAflObject {
         match state.corpus().get(corpus_id) {
             Ok(testcase) => {
                 if let Some(input) = testcase.borrow().input() {
-                    input.bytes().to_vec()
+                    input.mutator_bytes().to_vec()
                 } else {
                     Vec::new()
                 }

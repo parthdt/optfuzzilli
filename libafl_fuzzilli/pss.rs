@@ -6,8 +6,9 @@ use libafl::{
     feedbacks::{MaxMapFeedback, DifferentIsNovel, MapFeedback},
     inputs::{BytesInput, HasMutatorBytes},
     observers::{CanTrack, MapObserver, ExplicitTracking},
-    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler, Scheduler},
+    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler, ProbabilitySamplingScheduler, TestcaseScore, Scheduler, CoverageAccountingScheduler},
     state::{StdState, HasCorpus},
+    Error,
 };
 use libafl_bolts::{
     rands::RomuDuoJrRand,
@@ -18,10 +19,28 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::hash::{Hasher, Hash};
 
+const FACTOR: f64 = 1337.0;
+
+#[derive(Debug, Clone)]
+pub struct UniformDistribution {}
+
+impl<I, S> TestcaseScore<I, S> for UniformDistribution
+where
+    S: HasCorpus<I>,
+{
+    fn compute(_state: &S, _: &mut Testcase<I>) -> Result<f64, Error> {
+        Ok(FACTOR)
+    }
+}
+
+pub type UniformProbabilitySamplingScheduler =
+    ProbabilitySamplingScheduler<UniformDistribution>;
+
+
 #[derive(uniffi::Object, Debug)]
 pub struct LibAflObject {
-    state: Arc<Mutex<StdState<BytesInput, OnDiskCorpus<BytesInput>, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
-    scheduler: Arc<Mutex<IndexesLenTimeMinimizerScheduler<QueueScheduler, ExplicitTracking<FuzzilliCoverageObserver<'static>, true, false>>>>,
+    state: Arc<Mutex<StdState<OnDiskCorpus<BytesInput>, BytesInput, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
+    scheduler: Arc<Mutex<UniformProbabilitySamplingScheduler>>,
     _shmem: Arc<Mutex<MmapShMem>>, // Keep shared memory alive
 }
 
@@ -90,12 +109,6 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
         self.map.iter().map(|&x| x as u64).sum()
     }
 
-    fn hash_simple(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.map.hash(&mut hasher);
-        hasher.finish()
-    }
-
     fn reset_map(&mut self) -> Result<(), libafl::Error> {
         self.map.fill(self.initial);
         Ok(())
@@ -131,18 +144,24 @@ impl LibAflObject {
             unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(shmem_locked.as_slice_mut()) }
         };
 
+         // Create a clone of the slice for accounting map creation
+         let accounting_map = shared_mem_slice
+         .chunks_exact(4)
+         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+         .collect::<Vec<u32>>();
+
         let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_slice);
         let observer = raw_observer.track_indices();
 
-        let on_disk_corpus = OnDiskCorpus::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
-        let in_memory_corpus = InMemoryCorpus::new();
+        let on_disk_corpus = OnDiskCorpus::<BytesInput>::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
+        let in_memory_corpus = InMemoryCorpus::<BytesInput>::new();
 
         let rng = RomuDuoJrRand::with_seed(12345);
 
         let mut feedback = MaxMapFeedback::new(&observer);
         let mut objective_feedback = MaxMapFeedback::new(&observer);
 
-        let state = StdState::new(
+        let mut state = StdState::new(
             rng,
             on_disk_corpus,
             in_memory_corpus,
@@ -151,8 +170,7 @@ impl LibAflObject {
         )
         .expect("Failed to initialize StdState");
 
-        let scheduler = IndexesLenTimeMinimizerScheduler::new(&observer, QueueScheduler::new());
-
+        let mut scheduler: ProbabilitySamplingScheduler<_> = UniformProbabilitySamplingScheduler::new();
         Arc::new(Self {
             state: Arc::new(Mutex::new(state)),
             scheduler: Arc::new(Mutex::new(scheduler)),
@@ -176,7 +194,7 @@ impl LibAflObject {
         let testcase = state.corpus().get(next_id).unwrap();
         let borrowed = testcase.borrow();
         let input = borrowed.input().as_ref().unwrap();
-        input.bytes().to_vec()
+        input. mutator_bytes().to_vec()
     }
 
     pub fn count(&self) -> u64 {
@@ -206,7 +224,7 @@ impl LibAflObject {
         match state.corpus().get(corpus_id) {
             Ok(testcase) => {
                 if let Some(input) = testcase.borrow().input() {
-                    input.bytes().to_vec()
+                    input.mutator_bytes().to_vec()
                 } else {
                     Vec::new()
                 }

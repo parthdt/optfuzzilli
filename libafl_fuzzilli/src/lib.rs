@@ -6,8 +6,9 @@ use libafl::{
     feedbacks::{MaxMapFeedback, DifferentIsNovel, MapFeedback},
     inputs::{BytesInput, HasMutatorBytes},
     observers::{CanTrack, MapObserver, ExplicitTracking},
-    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler, Scheduler},
+    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler, ProbabilitySamplingScheduler, TestcaseScore, Scheduler, CoverageAccountingScheduler},
     state::{StdState, HasCorpus},
+    Error,
 };
 use libafl_bolts::{
     rands::RomuDuoJrRand,
@@ -18,10 +19,28 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::hash::{Hasher, Hash};
 
+const FACTOR: f64 = 1337.0;
+
+#[derive(Debug, Clone)]
+pub struct UniformDistribution {}
+
+impl<I, S> TestcaseScore<I, S> for UniformDistribution
+where
+    S: HasCorpus<I>,
+{
+    fn compute(_state: &S, _: &mut Testcase<I>) -> Result<f64, Error> {
+        Ok(FACTOR)
+    }
+}
+
+pub type UniformProbabilitySamplingScheduler =
+    ProbabilitySamplingScheduler<UniformDistribution>;
+
+
 #[derive(uniffi::Object, Debug)]
 pub struct LibAflObject {
     state: Arc<Mutex<StdState<OnDiskCorpus<BytesInput>, BytesInput, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
-    scheduler: Arc<Mutex<IndexesLenTimeMinimizerScheduler<QueueScheduler, BytesInput, ExplicitTracking<FuzzilliCoverageObserver<'static>, true, false>>>>,
+    scheduler: Arc<Mutex<UniformProbabilitySamplingScheduler>>,
     _shmem: Arc<Mutex<MmapShMem>>, // Keep shared memory alive
 }
 
@@ -125,6 +144,12 @@ impl LibAflObject {
             unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(shmem_locked.as_slice_mut()) }
         };
 
+         // Create a clone of the slice for accounting map creation
+         let accounting_map = shared_mem_slice
+         .chunks_exact(4)
+         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+         .collect::<Vec<u32>>();
+
         let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_slice);
         let observer = raw_observer.track_indices();
 
@@ -136,7 +161,7 @@ impl LibAflObject {
         let mut feedback = MaxMapFeedback::new(&observer);
         let mut objective_feedback = MaxMapFeedback::new(&observer);
 
-        let state = StdState::new(
+        let mut state = StdState::new(
             rng,
             on_disk_corpus,
             in_memory_corpus,
@@ -145,8 +170,7 @@ impl LibAflObject {
         )
         .expect("Failed to initialize StdState");
 
-        let scheduler = IndexesLenTimeMinimizerScheduler::new(&observer, QueueScheduler::new());
-
+        let mut scheduler: ProbabilitySamplingScheduler<_> = UniformProbabilitySamplingScheduler::new();
         Arc::new(Self {
             state: Arc::new(Mutex::new(state)),
             scheduler: Arc::new(Mutex::new(scheduler)),
