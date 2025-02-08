@@ -6,8 +6,9 @@ use libafl::{
     feedbacks::{MaxMapFeedback, DifferentIsNovel, MapFeedback},
     inputs::{BytesInput, HasMutatorBytes},
     observers::{CanTrack, MapObserver, ExplicitTracking},
-    schedulers::{CoverageAccountingScheduler, QueueScheduler, Scheduler},
+    schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler, ProbabilitySamplingScheduler, TestcaseScore, Scheduler, CoverageAccountingScheduler},
     state::{StdState, HasCorpus},
+    Error,
 };
 use libafl_bolts::{
     rands::RomuDuoJrRand,
@@ -18,30 +19,61 @@ use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::hash::{Hasher, Hash};
 
+const FACTOR: f64 = 1337.0;
+
+#[derive(Debug, Clone)]
+pub struct UniformDistribution {}
+
+impl<I, S> TestcaseScore<I, S> for UniformDistribution
+where
+    S: HasCorpus<I>,
+{
+    fn compute(_state: &S, _: &mut Testcase<I>) -> Result<f64, Error> {
+        Ok(FACTOR)
+    }
+}
+
+pub type UniformProbabilitySamplingScheduler =
+    ProbabilitySamplingScheduler<UniformDistribution>;
+
+
 #[derive(uniffi::Object, Debug)]
 pub struct LibAflObject {
-    state: Arc<Mutex<StdState<BytesInput, OnDiskCorpus<BytesInput>, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
-    scheduler: Arc<Mutex<CoverageAccountingScheduler<'static, QueueScheduler, ExplicitTracking<FuzzilliCoverageObserver<'static>, true, false>>>>,
+    state: Arc<Mutex<StdState<OnDiskCorpus<BytesInput>, BytesInput, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
+    scheduler: Arc<Mutex<CoverageAccountingScheduler<'static, QueueScheduler, BytesInput, ExplicitTracking<FuzzilliCoverageObserver<'static>, true, false>>>>,
     _shmem: Arc<Mutex<MmapShMem>>, // Keep shared memory alive
 }
 
 unsafe impl Send for LibAflObject {}
 unsafe impl Sync for LibAflObject {}
 
-/// Custom observer for Fuzzilli's shared memory layout.
+/// Custom observer for interpreting Fuzzilli's shared memory layout.
 #[derive(Debug, Serialize, Deserialize, Hash)]
 pub struct FuzzilliCoverageObserver<'a> {
     name: Cow<'static, str>,
     #[serde(skip)]
     map: &'a mut [u8],
+    num_edges: usize, // Stores number of edges from shmem
     initial: u8,
 }
 
 impl<'a> FuzzilliCoverageObserver<'a> {
     pub fn new(name: &'static str, map: &'a mut [u8]) -> Self {
+        if map.len() < 4 {
+            panic!("Shared memory too small to contain header!");
+        }
+
+        // Extract the number of edges from the first 4 bytes
+        let num_edges = u32::from_le_bytes(map[0..4].try_into().unwrap()) as usize;
+
+        if map.len() < 4 + (num_edges / 8) {
+            panic!("Shared memory does not contain enough coverage data!");
+        }
+
         Self {
             name: Cow::from(name),
             map,
+            num_edges,
             initial: 0,
         }
     }
@@ -55,13 +87,13 @@ impl<'a> Named for FuzzilliCoverageObserver<'a> {
 
 impl<'a> HasLen for FuzzilliCoverageObserver<'a> {
     fn len(&self) -> usize {
-        self.map.len()
+        self.num_edges
     }
 }
 
 impl<'a> AsRef<Self> for FuzzilliCoverageObserver<'a> {
     fn as_ref(&self) -> &Self {
-        self
+        &self
     }
 }
 
@@ -75,29 +107,40 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
     type Entry = u8;
 
     fn get(&self, idx: usize) -> Self::Entry {
-        self.map[idx]
+        if idx >= self.num_edges {
+            0
+        } else {
+            let byte_idx = 4 + (idx / 8);
+            let bit_idx = idx % 8;
+            (self.map[byte_idx] >> bit_idx) & 1
+        }
     }
 
     fn set(&mut self, idx: usize, value: Self::Entry) {
-        self.map[idx] = value;
+        if idx < self.num_edges {
+            let byte_idx = 4 + (idx / 8);
+            let bit_idx = idx % 8;
+            if value != 0 {
+                self.map[byte_idx] |= 1 << bit_idx;
+            } else {
+                self.map[byte_idx] &= !(1 << bit_idx);
+            }
+        }
     }
 
     fn usable_count(&self) -> usize {
-        self.map.len()
+        self.num_edges // Each bit represents an edge
     }
 
     fn count_bytes(&self) -> u64 {
-        self.map.iter().map(|&x| x as u64).sum()
-    }
-
-    fn hash_simple(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self.map.hash(&mut hasher);
-        hasher.finish()
+        self.map[4..(4 + (self.num_edges / 8))]
+            .iter()
+            .map(|&byte| byte.count_ones() as u64)
+            .sum()
     }
 
     fn reset_map(&mut self) -> Result<(), libafl::Error> {
-        self.map.fill(self.initial);
+        self.map[4..(4 + (self.num_edges / 8))].fill(0);
         Ok(())
     }
 
@@ -106,11 +149,15 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
     }
 
     fn to_vec(&self) -> Vec<Self::Entry> {
-        self.map.to_vec()
+        let mut bits = Vec::with_capacity(self.num_edges);
+        for idx in 0..self.num_edges {
+            bits.push(self.get(idx));
+        }
+        bits
     }
 
     fn how_many_set(&self, indices: &[usize]) -> usize {
-        indices.iter().filter(|&&idx| self.map[idx] > 0).count()
+        indices.iter().filter(|&&idx| self.get(idx) > 0).count()
     }
 }
 
@@ -126,23 +173,24 @@ impl LibAflObject {
 
         let shmem_arc = Arc::new(Mutex::new(shmem));
 
-        // Clone the shared memory slice to resolve borrowing conflict
         let shared_mem_slice: &'static mut [u8] = {
             let mut shmem_locked = shmem_arc.lock().unwrap();
             unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(shmem_locked.as_slice_mut()) }
         };
+        
+        let coverage_data = &shared_mem_slice[4..];
+        let num_edges = u32::from_le_bytes(shared_mem_slice[0..4].try_into().unwrap()) as usize;
+         // Create a clone of the slice for accounting map creation
+        let accounting_map: Vec<u32> = coverage_data
+        .iter()
+        .take(num_edges)
+        .map(|&byte| byte as u32)
+        .collect();
 
-        // Create a clone of the slice for accounting map creation
-        let accounting_map = shared_mem_slice
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-            .collect::<Vec<u32>>();
+        let observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_slice).track_indices();
 
-        let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_slice);
-        let observer = raw_observer.track_indices();
-
-        let on_disk_corpus = OnDiskCorpus::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
-        let in_memory_corpus = InMemoryCorpus::new();
+        let on_disk_corpus = OnDiskCorpus::<BytesInput>::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
+        let in_memory_corpus = InMemoryCorpus::<BytesInput>::new();
 
         let rng = RomuDuoJrRand::with_seed(12345);
 
@@ -159,7 +207,6 @@ impl LibAflObject {
         .expect("Failed to initialize StdState");
 
         let scheduler = CoverageAccountingScheduler::new(&observer, &mut state, QueueScheduler::new(), Box::leak(accounting_map.into_boxed_slice()));
-
         Arc::new(Self {
             state: Arc::new(Mutex::new(state)),
             scheduler: Arc::new(Mutex::new(scheduler)),
@@ -175,6 +222,7 @@ impl LibAflObject {
         state.corpus_mut().add(testcase).expect("Failed to add testcase to corpus");
     }
 
+
     pub fn suggest_next_input(&self) -> Vec<u8> {
         let mut scheduler = self.scheduler.lock().unwrap();
         let mut state = self.state.lock().unwrap();
@@ -182,7 +230,7 @@ impl LibAflObject {
         let testcase = state.corpus().get(next_id).unwrap();
         let borrowed = testcase.borrow();
         let input = borrowed.input().as_ref().unwrap();
-        input.bytes().to_vec()
+        input. mutator_bytes().to_vec()
     }
 
     pub fn count(&self) -> u64 {
@@ -212,7 +260,7 @@ impl LibAflObject {
         match state.corpus().get(corpus_id) {
             Ok(testcase) => {
                 if let Some(input) = testcase.borrow().input() {
-                    input.bytes().to_vec()
+                    input.mutator_bytes().to_vec()
                 } else {
                     Vec::new()
                 }

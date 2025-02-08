@@ -47,20 +47,33 @@ pub struct LibAflObject {
 unsafe impl Send for LibAflObject {}
 unsafe impl Sync for LibAflObject {}
 
-/// Custom observer for Fuzzilli's shared memory layout.
+/// Custom observer for interpreting Fuzzilli's shared memory layout.
 #[derive(Debug, Serialize, Deserialize, Hash)]
 pub struct FuzzilliCoverageObserver<'a> {
     name: Cow<'static, str>,
     #[serde(skip)]
     map: &'a mut [u8],
+    num_edges: usize, // Stores number of edges from shmem
     initial: u8,
 }
 
 impl<'a> FuzzilliCoverageObserver<'a> {
     pub fn new(name: &'static str, map: &'a mut [u8]) -> Self {
+        if map.len() < 4 {
+            panic!("Shared memory too small to contain header!");
+        }
+
+        // Extract the number of edges from the first 4 bytes
+        let num_edges = u32::from_le_bytes(map[0..4].try_into().unwrap()) as usize;
+
+        if map.len() < 4 + (num_edges / 8) {
+            panic!("Shared memory does not contain enough coverage data!");
+        }
+
         Self {
             name: Cow::from(name),
             map,
+            num_edges,
             initial: 0,
         }
     }
@@ -74,13 +87,13 @@ impl<'a> Named for FuzzilliCoverageObserver<'a> {
 
 impl<'a> HasLen for FuzzilliCoverageObserver<'a> {
     fn len(&self) -> usize {
-        self.map.len()
+        self.num_edges
     }
 }
 
 impl<'a> AsRef<Self> for FuzzilliCoverageObserver<'a> {
     fn as_ref(&self) -> &Self {
-        self
+        &self
     }
 }
 
@@ -94,23 +107,40 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
     type Entry = u8;
 
     fn get(&self, idx: usize) -> Self::Entry {
-        self.map[idx]
+        if idx >= self.num_edges {
+            0
+        } else {
+            let byte_idx = 4 + (idx / 8);
+            let bit_idx = idx % 8;
+            (self.map[byte_idx] >> bit_idx) & 1
+        }
     }
 
     fn set(&mut self, idx: usize, value: Self::Entry) {
-        self.map[idx] = value;
+        if idx < self.num_edges {
+            let byte_idx = 4 + (idx / 8);
+            let bit_idx = idx % 8;
+            if value != 0 {
+                self.map[byte_idx] |= 1 << bit_idx;
+            } else {
+                self.map[byte_idx] &= !(1 << bit_idx);
+            }
+        }
     }
 
     fn usable_count(&self) -> usize {
-        self.map.len()
+        self.num_edges // Each bit represents an edge
     }
 
     fn count_bytes(&self) -> u64 {
-        self.map.iter().map(|&x| x as u64).sum()
+        self.map[4..(4 + (self.num_edges / 8))]
+            .iter()
+            .map(|&byte| byte.count_ones() as u64)
+            .sum()
     }
 
     fn reset_map(&mut self) -> Result<(), libafl::Error> {
-        self.map.fill(self.initial);
+        self.map[4..(4 + (self.num_edges / 8))].fill(0);
         Ok(())
     }
 
@@ -119,13 +149,18 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
     }
 
     fn to_vec(&self) -> Vec<Self::Entry> {
-        self.map.to_vec()
+        let mut bits = Vec::with_capacity(self.num_edges);
+        for idx in 0..self.num_edges {
+            bits.push(self.get(idx));
+        }
+        bits
     }
 
     fn how_many_set(&self, indices: &[usize]) -> usize {
-        indices.iter().filter(|&&idx| self.map[idx] > 0).count()
+        indices.iter().filter(|&&idx| self.get(idx) > 0).count()
     }
 }
+
 
 #[uniffi::export]
 impl LibAflObject {
@@ -144,11 +179,14 @@ impl LibAflObject {
             unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(shmem_locked.as_slice_mut()) }
         };
 
+        let coverage_data = &shared_mem_slice[4..];
+        let num_edges = u32::from_le_bytes(shared_mem_slice[0..4].try_into().unwrap()) as usize;
          // Create a clone of the slice for accounting map creation
-         let accounting_map = shared_mem_slice
-         .chunks_exact(4)
-         .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
-         .collect::<Vec<u32>>();
+        let accounting_map: Vec<u32> = coverage_data
+        .iter()
+        .take(num_edges)
+        .map(|&byte| byte as u32)
+        .collect();
 
         let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_slice);
         let observer = raw_observer.track_indices();
