@@ -8,62 +8,62 @@ use libafl::{
     observers::{CanTrack, MapObserver, ExplicitTracking},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler, ProbabilitySamplingScheduler, TestcaseScore, Scheduler, CoverageAccountingScheduler},
     state::{StdState, HasCorpus},
-    Error,
+    Error, HasMetadata, HasNamedMetadata
 };
 use libafl_bolts::{
     rands::RomuDuoJrRand,
     shmem::{MmapShMem, MmapShMemProvider, ShMemProvider, ShMemId},
-    Named, HasLen, AsSliceMut,
+    Named, HasLen, AsSliceMut, serdeany::SerdeAny, AsSlice, serdeany::RegistryBuilder,
 };
+use libafl_bolts::impl_serdeany;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::hash::{Hasher, Hash};
+use std::any::Any;
 
-const FACTOR: f64 = 1337.0;
-
+/// **Uniform Probability Distribution for Sampling Scheduler**
 #[derive(Debug, Clone)]
 pub struct UniformDistribution {}
 
-impl<I, S> TestcaseScore<I, S> for UniformDistribution
+impl<S> TestcaseScore<BytesInput, S> for UniformDistribution
 where
-    S: HasCorpus<I>,
+    S: HasCorpus<BytesInput> + HasMetadata + HasNamedMetadata,
 {
-    fn compute(_state: &S, _: &mut Testcase<I>) -> Result<f64, Error> {
-        Ok(FACTOR)
+    fn compute(state: &S, testcase: &mut Testcase<BytesInput>) -> Result<f64, Error> {
+        // Fetch observer from metadata
+        let observer = state
+            .metadata_map()
+            .get::<FuzzilliCoverageObserver>()
+            .ok_or_else(|| Error::key_not_found("FuzzilliCoverageObserver not found"))?;
+
+        let coverage_count = observer.count_bytes() as f64;
+        let input_length = testcase.input().as_ref().map(|i| i.len() as f64).unwrap_or(0.0);
+        
+        // Score based on coverage count and input length
+        let score = (coverage_count * 10.0) - (input_length * 0.1);
+        Ok(score.max(1.0)) // Ensure min score of 1.0
     }
 }
 
 pub type UniformProbabilitySamplingScheduler =
     ProbabilitySamplingScheduler<UniformDistribution>;
 
-
-#[derive(uniffi::Object, Debug)]
-pub struct LibAflObject {
-    state: Arc<Mutex<StdState<OnDiskCorpus<BytesInput>, BytesInput, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
-    scheduler: Arc<Mutex<UniformProbabilitySamplingScheduler>>,
-    _shmem: Arc<Mutex<MmapShMem>>, // Keep shared memory alive
-}
-
-unsafe impl Send for LibAflObject {}
-unsafe impl Sync for LibAflObject {}
-
-/// Custom observer for interpreting Fuzzilli's shared memory layout.
-#[derive(Debug, Serialize, Deserialize, Hash)]
-pub struct FuzzilliCoverageObserver<'a> {
+/// **Custom Observer for Fuzzilli's Bit-Level Shared Memory Layout**
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FuzzilliCoverageObserver {
     name: Cow<'static, str>,
     #[serde(skip)]
-    map: &'a mut [u8],
-    num_edges: usize, // Stores number of edges from shmem
+    map: Vec<u8>,  // Store memory directly (no Arc<Mutex<>>)
+    num_edges: usize,
     initial: u8,
 }
+impl_serdeany!(FuzzilliCoverageObserver);
 
-impl<'a> FuzzilliCoverageObserver<'a> {
-    pub fn new(name: &'static str, map: &'a mut [u8]) -> Self {
+impl FuzzilliCoverageObserver {
+    pub fn new(name: &'static str, map: Vec<u8>) -> Self {
         if map.len() < 4 {
             panic!("Shared memory too small to contain header!");
         }
 
-        // Extract the number of edges from the first 4 bytes
         let num_edges = u32::from_le_bytes(map[0..4].try_into().unwrap()) as usize;
 
         if map.len() < 4 + (num_edges / 8) {
@@ -79,31 +79,70 @@ impl<'a> FuzzilliCoverageObserver<'a> {
     }
 }
 
-impl<'a> Named for FuzzilliCoverageObserver<'a> {
+// impl SerdeAny for FuzzilliCoverageObserver {
+//     fn as_any(&self) -> &(dyn Any + 'static) {
+//         self
+//     }
+
+//     fn as_any_mut(&mut self) -> &mut (dyn Any + 'static) {
+//         self
+//     }
+
+//     fn as_any_boxed(self: Box<Self>) -> Box<dyn Any> {
+//         self
+//     }
+
+//     fn type_name(&self) -> &'static str {
+//         "FuzzilliCoverageObserver"
+//     }
+// }
+
+// impl SerdeAny for Box<FuzzilliCoverageObserver> {
+
+//     fn as_any(&self) -> &(dyn Any + 'static) {
+//         self
+//     }
+
+//     fn as_any_mut(&mut self) -> &mut (dyn Any + 'static) {
+//         self
+//     }
+
+//     fn as_any_boxed(self: Box<Self>) -> Box<dyn Any> {
+//         self
+//     }
+
+//     fn type_name(&self) -> &'static str {
+//         "FuzzilliCoverageObserver"
+//     }
+// }
+
+
+impl Named for FuzzilliCoverageObserver {
     fn name(&self) -> &Cow<'static, str> {
         &self.name
     }
 }
 
-impl<'a> HasLen for FuzzilliCoverageObserver<'a> {
+impl HasLen for FuzzilliCoverageObserver {
     fn len(&self) -> usize {
         self.num_edges
     }
 }
 
-impl<'a> AsRef<Self> for FuzzilliCoverageObserver<'a> {
+// ** FIX: Implement AsRef & AsMut required by MapObserver **
+impl AsRef<Self> for FuzzilliCoverageObserver {
     fn as_ref(&self) -> &Self {
-        &self
+        self
     }
 }
 
-impl<'a> AsMut<Self> for FuzzilliCoverageObserver<'a> {
+impl AsMut<Self> for FuzzilliCoverageObserver {
     fn as_mut(&mut self) -> &mut Self {
         self
     }
 }
 
-impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
+impl MapObserver for FuzzilliCoverageObserver {
     type Entry = u8;
 
     fn get(&self, idx: usize) -> Self::Entry {
@@ -129,18 +168,15 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
     }
 
     fn usable_count(&self) -> usize {
-        self.num_edges // Each bit represents an edge
+        self.num_edges
     }
 
     fn count_bytes(&self) -> u64 {
-        self.map[4..(4 + (self.num_edges / 8))]
-            .iter()
-            .map(|&byte| byte.count_ones() as u64)
-            .sum()
+        self.map.iter().map(|&byte| byte.count_ones() as u64).sum()
     }
 
     fn reset_map(&mut self) -> Result<(), libafl::Error> {
-        self.map[4..(4 + (self.num_edges / 8))].fill(0);
+        self.map.fill(0);
         Ok(())
     }
 
@@ -161,11 +197,47 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
     }
 }
 
+#[derive(Debug)]
+pub enum SchedulerEnum {
+    UniformProbability(UniformProbabilitySamplingScheduler),
+    Queue(QueueScheduler),
+    CoverageAccounting(
+        CoverageAccountingScheduler<
+            'static,
+            QueueScheduler,
+            BytesInput,
+            ExplicitTracking<FuzzilliCoverageObserver, true, false>,
+        >,
+    ),
+    IndexesLenTimeMinimizer(
+        IndexesLenTimeMinimizerScheduler<QueueScheduler, BytesInput, ExplicitTracking<FuzzilliCoverageObserver, true, false>>,
+    ),
+}
+    
+
+#[derive(uniffi::Object, Debug)]
+pub struct LibAflObject {
+    state: Arc<Mutex<StdState<OnDiskCorpus<BytesInput>, BytesInput, RomuDuoJrRand, InMemoryCorpus<BytesInput>>>>,
+    scheduler: Arc<Mutex<SchedulerEnum>>,
+    _shmem: Arc<Mutex<MmapShMem>>, // Keep shared memory alive
+}
+
+unsafe impl Send for LibAflObject {}
+unsafe impl Sync for LibAflObject {}
 
 #[uniffi::export]
 impl LibAflObject {
     #[uniffi::constructor]
-    pub fn new(corpus_dir: String, shmem_key: String) -> Arc<Self> {
+    pub fn new(corpus_dir: String, shmem_key: String, scheduler_type: u8) -> Arc<Self> {
+
+        match scheduler_type {
+            1 => println!("Using UniformProbabilityScheduler"),
+            2 => println!("Using QueueScheduler"),
+            3 => println!("Using CoverageAccountingScheduler"),
+            4 => println!("Using IndexesLenTimeMinimizerScheduler"),
+            _ => println!("Unknown scheduler type"),
+        }
+
         let mut shmem_provider = MmapShMemProvider::new().expect("Failed to create shared memory provider");
         let shmem_id = ShMemId::from_string(&shmem_key);
         let shmem = shmem_provider
@@ -174,13 +246,13 @@ impl LibAflObject {
 
         let shmem_arc = Arc::new(Mutex::new(shmem));
 
-        let shared_mem_slice: &'static mut [u8] = {
-            let mut shmem_locked = shmem_arc.lock().unwrap();
-            unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(shmem_locked.as_slice_mut()) }
+        let shared_mem_vec = {
+            let shmem_locked = shmem_arc.lock().unwrap();
+            shmem_locked.as_slice().to_vec()
         };
 
-        let coverage_data = &shared_mem_slice[4..];
-        let num_edges = u32::from_le_bytes(shared_mem_slice[0..4].try_into().unwrap()) as usize;
+        let coverage_data = &shared_mem_vec[4..];
+        let num_edges = u32::from_le_bytes(shared_mem_vec[0..4].try_into().unwrap()) as usize;
          // Create a clone of the slice for accounting map creation
         let accounting_map: Vec<u32> = coverage_data
         .iter()
@@ -188,7 +260,8 @@ impl LibAflObject {
         .map(|&byte| byte as u32)
         .collect();
 
-        let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_slice);
+        let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_vec.clone());
+        let observer_clone = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_vec.clone());
         let observer = raw_observer.track_indices();
 
         let on_disk_corpus = OnDiskCorpus::<BytesInput>::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
@@ -208,7 +281,25 @@ impl LibAflObject {
         )
         .expect("Failed to initialize StdState");
 
-        let mut scheduler: ProbabilitySamplingScheduler<_> = UniformProbabilitySamplingScheduler::new();
+        // Now we can insert the observer
+        state.metadata_map_mut().insert(observer_clone);
+        
+        let scheduler = match scheduler_type {
+            1 => SchedulerEnum::UniformProbability(UniformProbabilitySamplingScheduler::new()),
+            2 => SchedulerEnum::Queue(QueueScheduler::new()),
+            3 => SchedulerEnum::CoverageAccounting(CoverageAccountingScheduler::new(
+                &observer,
+                &mut state,
+                QueueScheduler::new(),
+                Box::leak(accounting_map.into_boxed_slice()),
+            )),
+            4 => SchedulerEnum::IndexesLenTimeMinimizer(IndexesLenTimeMinimizerScheduler::new(
+                &observer,
+                QueueScheduler::new(),
+            )),
+            _ => panic!("Invalid scheduler type! Use 1, 2, 3, or 4."),
+        };
+
         Arc::new(Self {
             state: Arc::new(Mutex::new(state)),
             scheduler: Arc::new(Mutex::new(scheduler)),
@@ -228,7 +319,15 @@ impl LibAflObject {
     pub fn suggest_next_input(&self) -> Vec<u8> {
         let mut scheduler = self.scheduler.lock().unwrap();
         let mut state = self.state.lock().unwrap();
-        let next_id = scheduler.next(&mut *state).expect("Failed to fetch next input ID");
+
+        let next_id = match &mut *scheduler {
+            SchedulerEnum::UniformProbability(s) => s.next(&mut *state),
+            SchedulerEnum::Queue(s) => s.next(&mut *state),
+            SchedulerEnum::CoverageAccounting(s) => s.next(&mut *state),
+            SchedulerEnum::IndexesLenTimeMinimizer(s) => s.next(&mut *state),
+        }.expect("Failed to fetch next input ID");
+        // let next_id = scheduler.next(&mut *state).expect("Failed to fetch next input ID");
+        println!("Current Corpus ID: {}\n", next_id); // Print the corpus ID followed by a newline
         let testcase = state.corpus().get(next_id).unwrap();
         let borrowed = testcase.borrow();
         let input = borrowed.input().as_ref().unwrap();
