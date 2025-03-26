@@ -3,11 +3,11 @@
 use std::sync::{Arc, Mutex};
 use libafl::{
     corpus::{InMemoryCorpus, OnDiskCorpus, Testcase, Corpus, CorpusId},
-    feedbacks::{MaxMapFeedback, DifferentIsNovel, MapFeedback},
+    feedbacks::{MaxMapFeedback, DifferentIsNovel, MapFeedback, ConstFeedback},
     inputs::{BytesInput, HasMutatorBytes},
     observers::{CanTrack, MapObserver, ExplicitTracking},
     schedulers::{IndexesLenTimeMinimizerScheduler, QueueScheduler, ProbabilitySamplingScheduler, TestcaseScore, Scheduler, CoverageAccountingScheduler},
-    state::{StdState, HasCorpus},
+    state::{StdState, HasCorpus, HasSolutions},
     Error, HasMetadata, HasNamedMetadata
 };
 use libafl_bolts::{
@@ -270,7 +270,7 @@ impl LibAflObject {
         let rng = RomuDuoJrRand::with_seed(12345);
 
         let mut feedback = MaxMapFeedback::new(&observer);
-        let mut objective_feedback = MaxMapFeedback::new(&observer);
+        let mut objective_feedback = ConstFeedback::new(false);
 
         let mut state = StdState::new(
             rng,
@@ -313,8 +313,9 @@ impl LibAflObject {
         let testcase = Testcase::new(input);
         let mut state = self.state.lock().unwrap();
         state.corpus_mut().add(testcase).expect("Failed to add testcase to corpus");
+        let cur_count = state.solutions().count() as u64;
+        // println!("Added input to corpus. Current count of solutions corpus: {}", cur_count);
     }
-
 
     pub fn suggest_next_input(&self) -> Vec<u8> {
         let mut scheduler = self.scheduler.lock().unwrap();
@@ -327,7 +328,6 @@ impl LibAflObject {
             SchedulerEnum::IndexesLenTimeMinimizer(s) => s.next(&mut *state),
         }.expect("Failed to fetch next input ID");
         // let next_id = scheduler.next(&mut *state).expect("Failed to fetch next input ID");
-        println!("Current Corpus ID: {}\n", next_id); // Print the corpus ID followed by a newline
         let testcase = state.corpus().get(next_id).unwrap();
         let borrowed = testcase.borrow();
         let input = borrowed.input().as_ref().unwrap();
