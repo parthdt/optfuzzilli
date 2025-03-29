@@ -29,18 +29,31 @@ where
     S: HasCorpus<BytesInput> + HasMetadata + HasNamedMetadata,
 {
     fn compute(state: &S, testcase: &mut Testcase<BytesInput>) -> Result<f64, Error> {
-        // Fetch observer from metadata
-        let observer = state
-            .metadata_map()
-            .get::<FuzzilliCoverageObserver>()
-            .ok_or_else(|| Error::key_not_found("FuzzilliCoverageObserver not found"))?;
+        // Attempt to fetch the observer, return 0.25 if it fails
+        let observer = match state.metadata_map().get::<FuzzilliCoverageObserver>() {
+            Some(obs) => obs,
+            None => {
+                println!("\n\nPROBLEM IN THE COMPUTE FUNCTION WHILE FETCHING FuzzilliCoverageObserver\n\n");
+                return Ok(0.25);
+            }
+        };
+
+        // Attempt to get input length, return 0.25 if there is an error
+        let input_length = match testcase.input() {
+            Some(input) => input.len() as f64,
+            None => {
+                println!("\n\nPROBLEM IN THE COMPUTE FUNCTION WHILE GETTING INPUT LENGTH\n\n");
+                return Ok(0.25);
+            }
+        };
 
         let coverage_count = observer.count_bytes() as f64;
-        let input_length = testcase.input().as_ref().map(|i| i.len() as f64).unwrap_or(0.0);
         
-        // Score based on coverage count and input length
+        // Compute the score
         let score = (coverage_count * 10.0) - (input_length * 0.1);
-        Ok(score.max(1.0)) // Ensure min score of 1.0
+        
+        // Ensure minimum score of 1.0
+        Ok(score.max(1.0))
     }
 }
 
@@ -64,7 +77,7 @@ impl FuzzilliCoverageObserver {
             panic!("Shared memory too small to contain header!");
         }
 
-        let num_edges = u32::from_le_bytes(map[0..4].try_into().unwrap()) as usize;
+        let num_edges = u32::from_le_bytes(map[0..4].try_into().expect("Line 67 lib.rs failed")) as usize;
 
         if map.len() < 4 + (num_edges / 8) {
             panic!("Shared memory does not contain enough coverage data!");
@@ -78,44 +91,6 @@ impl FuzzilliCoverageObserver {
         }
     }
 }
-
-// impl SerdeAny for FuzzilliCoverageObserver {
-//     fn as_any(&self) -> &(dyn Any + 'static) {
-//         self
-//     }
-
-//     fn as_any_mut(&mut self) -> &mut (dyn Any + 'static) {
-//         self
-//     }
-
-//     fn as_any_boxed(self: Box<Self>) -> Box<dyn Any> {
-//         self
-//     }
-
-//     fn type_name(&self) -> &'static str {
-//         "FuzzilliCoverageObserver"
-//     }
-// }
-
-// impl SerdeAny for Box<FuzzilliCoverageObserver> {
-
-//     fn as_any(&self) -> &(dyn Any + 'static) {
-//         self
-//     }
-
-//     fn as_any_mut(&mut self) -> &mut (dyn Any + 'static) {
-//         self
-//     }
-
-//     fn as_any_boxed(self: Box<Self>) -> Box<dyn Any> {
-//         self
-//     }
-
-//     fn type_name(&self) -> &'static str {
-//         "FuzzilliCoverageObserver"
-//     }
-// }
-
 
 impl Named for FuzzilliCoverageObserver {
     fn name(&self) -> &Cow<'static, str> {
@@ -238,11 +213,11 @@ impl LibAflObject {
             _ => println!("Unknown scheduler type"),
         }
 
-        let mut shmem_provider = MmapShMemProvider::new().expect("Failed to create shared memory provider");
+        let mut shmem_provider = MmapShMemProvider::new().expect("Failed to create shared memory provider, line 241 lib.rs failed");
         let shmem_id = ShMemId::from_string(&shmem_key);
         let shmem = shmem_provider
             .shmem_from_id_and_size(shmem_id, 0x200000)
-            .expect("Failed to attach to shared memory");
+            .expect("Failed to attach to shared memory, line 245 lib.rs failed");
 
         let shmem_arc = Arc::new(Mutex::new(shmem));
 
@@ -252,7 +227,7 @@ impl LibAflObject {
         };
 
         let coverage_data = &shared_mem_vec[4..];
-        let num_edges = u32::from_le_bytes(shared_mem_vec[0..4].try_into().unwrap()) as usize;
+        let num_edges = u32::from_le_bytes(shared_mem_vec[0..4].try_into().expect("line 255 lib.rs failed")) as usize;
          // Create a clone of the slice for accounting map creation
         let accounting_map: Vec<u32> = coverage_data
         .iter()
@@ -264,7 +239,7 @@ impl LibAflObject {
         let observer_clone = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_vec.clone());
         let observer = raw_observer.track_indices();
 
-        let on_disk_corpus = OnDiskCorpus::<BytesInput>::new(&corpus_dir).expect("Failed to create OnDiskCorpus");
+        let on_disk_corpus = OnDiskCorpus::<BytesInput>::new(&corpus_dir).expect("Failed to create OnDiskCorpus, line 267 lib.rs failed");
         let in_memory_corpus = InMemoryCorpus::<BytesInput>::new();
 
         let rng = RomuDuoJrRand::with_seed(12345);
@@ -279,7 +254,7 @@ impl LibAflObject {
             &mut feedback,
             &mut objective_feedback,
         )
-        .expect("Failed to initialize StdState");
+        .expect("Failed to initialize StdState, line 282 lib.rs failed");
 
         // Now we can insert the observer
         state.metadata_map_mut().insert(observer_clone);
@@ -297,7 +272,7 @@ impl LibAflObject {
                 &observer,
                 QueueScheduler::new(),
             )),
-            _ => panic!("Invalid scheduler type! Use 1, 2, 3, or 4."),
+            _ => panic!("Invalid scheduler type! Use 1, 2, 3, or 4. Line 300 lib.rs failed"),
         };
 
         Arc::new(Self {
@@ -312,10 +287,20 @@ impl LibAflObject {
         let input = BytesInput::new(input_data);
         let testcase = Testcase::new(input);
         let mut state = self.state.lock().unwrap();
-        state.corpus_mut().add(testcase).expect("Failed to add testcase to corpus");
+        
+        // Add the input to the corpus and get the index
+        let idx = state.corpus_mut().add(testcase).expect("Failed to add testcase to corpus");
+        
+        // Check the scheduler type and call on_add if UniformProbability
+        match &mut *self.scheduler.lock().unwrap() {
+            SchedulerEnum::UniformProbability(s) => s.on_add(&mut *state, idx).unwrap(),
+            _ => {}, // For other schedulers, no need to call on_add
+        }
+        
         let cur_count = state.solutions().count() as u64;
         // println!("Added input to corpus. Current count of solutions corpus: {}", cur_count);
     }
+    
 
     pub fn suggest_next_input(&self) -> Vec<u8> {
         let mut scheduler = self.scheduler.lock().unwrap();
@@ -326,7 +311,7 @@ impl LibAflObject {
             SchedulerEnum::Queue(s) => s.next(&mut *state),
             SchedulerEnum::CoverageAccounting(s) => s.next(&mut *state),
             SchedulerEnum::IndexesLenTimeMinimizer(s) => s.next(&mut *state),
-        }.expect("Failed to fetch next input ID");
+        }.expect("Failed to fetch next input ID, line 329 lib.rs failed");
         // let next_id = scheduler.next(&mut *state).expect("Failed to fetch next input ID");
         let testcase = state.corpus().get(next_id).unwrap();
         let borrowed = testcase.borrow();

@@ -1,21 +1,21 @@
 #![allow(unused_imports, dead_code, unused_variables)]
 
 use libafl::{
-    corpus::{Corpus, InMemoryCorpus, Testcase},
+    corpus::{Corpus, InMemoryCorpus, Testcase, CorpusId},
     feedbacks::MaxMapFeedback,
     inputs::{BytesInput, HasTargetBytes},
     observers::{CanTrack, MapObserver},
-    schedulers::{CoverageAccountingScheduler, IndexesLenTimeMinimizerScheduler, QueueScheduler, Scheduler},
-    state::{HasCorpus, StdState},
+    schedulers::{ProbabilitySamplingScheduler, probabilistic_sampling::ProbabilityMetadata, Scheduler, TestcaseScore},
+    state::{HasCorpus, StdState}, HasMetadata, HasNamedMetadata, Error
 };
 use libafl_bolts::{
     rands::RomuDuoJrRand,
     shmem::{MmapShMemProvider, ShMemId, ShMemProvider},
-    AsSliceMut, HasLen, Named,
+    AsSliceMut, AsSlice, HasLen, Named, impl_serdeany
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    borrow::Cow,
+    borrow::{Cow, BorrowMut},
     collections::HashMap,
     fs,
     hash::{Hash, Hasher},
@@ -24,24 +24,64 @@ use std::{
     time::Duration,
 };
 
-/// Custom observer for interpreting Fuzzilli's shared memory layout.
-#[derive(Debug, Serialize, Deserialize, Hash)]
-pub struct FuzzilliCoverageObserver<'a> {
-    name: Cow<'static, str>,
-    #[serde(skip)]
-    map: &'a mut [u8],
-    num_edges: usize, // Stores number of edges from shmem
-    initial: u8,
+/// **Uniform Probability Distribution for Sampling Scheduler**
+#[derive(Debug, Clone)]
+pub struct UniformDistribution {}
+
+impl<S> TestcaseScore<BytesInput, S> for UniformDistribution
+where
+    S: HasCorpus<BytesInput> + HasMetadata + HasNamedMetadata,
+{
+    fn compute(state: &S, testcase: &mut Testcase<BytesInput>) -> Result<f64, Error> {
+        // Attempt to fetch the observer, return 0.25 if it fails
+        let observer = match state.metadata_map().get::<FuzzilliCoverageObserver>() {
+            Some(obs) => obs,
+            None => {
+                println!("\n\nPROBLEM IN THE COMPUTE FUNCTION WHILE FETCHING FuzzilliCoverageObserver\n\n");
+                return Ok(0.25);
+            }
+        };
+
+        // Attempt to get input length, return 0.25 if there is an error
+        let input_length = match testcase.input() {
+            Some(input) => input.len() as f64,
+            None => {
+                println!("\n\nPROBLEM IN THE COMPUTE FUNCTION WHILE GETTING INPUT LENGTH\n\n");
+                return Ok(0.25);
+            }
+        };
+
+        let coverage_count = observer.count_bytes() as f64;
+        
+        // Compute the score
+        let score = (coverage_count * 10.0) - (input_length * 0.1);
+        
+        // Ensure minimum score of 1.0
+        Ok(score.max(1.0))
+    }
 }
 
-impl<'a> FuzzilliCoverageObserver<'a> {
-    pub fn new(name: &'static str, map: &'a mut [u8]) -> Self {
+pub type UniformProbabilitySamplingScheduler =
+    ProbabilitySamplingScheduler<UniformDistribution>;
+
+// **Custom Observer for Fuzzilli's Bit-Level Shared Memory Layout**
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FuzzilliCoverageObserver {
+    name: Cow<'static, str>,
+    #[serde(skip)]
+    map: Vec<u8>,  // Store memory directly (no Arc<Mutex<>>)
+    num_edges: usize,
+    initial: u8,
+}
+impl_serdeany!(FuzzilliCoverageObserver);
+
+impl FuzzilliCoverageObserver {
+    pub fn new(name: &'static str, map: Vec<u8>) -> Self {
         if map.len() < 4 {
             panic!("Shared memory too small to contain header!");
         }
 
-        // Extract the number of edges from the first 4 bytes
-        let num_edges = u32::from_le_bytes(map[0..4].try_into().unwrap()) as usize;
+        let num_edges = u32::from_le_bytes(map[0..4].try_into().expect("Line 67 lib.rs failed")) as usize;
 
         if map.len() < 4 + (num_edges / 8) {
             panic!("Shared memory does not contain enough coverage data!");
@@ -56,31 +96,32 @@ impl<'a> FuzzilliCoverageObserver<'a> {
     }
 }
 
-impl<'a> Named for FuzzilliCoverageObserver<'a> {
+impl Named for FuzzilliCoverageObserver {
     fn name(&self) -> &Cow<'static, str> {
         &self.name
     }
 }
 
-impl<'a> HasLen for FuzzilliCoverageObserver<'a> {
+impl HasLen for FuzzilliCoverageObserver {
     fn len(&self) -> usize {
         self.num_edges
     }
 }
 
-impl<'a> AsRef<Self> for FuzzilliCoverageObserver<'a> {
+// ** FIX: Implement AsRef & AsMut required by MapObserver **
+impl AsRef<Self> for FuzzilliCoverageObserver {
     fn as_ref(&self) -> &Self {
-        &self
+        self
     }
 }
 
-impl<'a> AsMut<Self> for FuzzilliCoverageObserver<'a> {
+impl AsMut<Self> for FuzzilliCoverageObserver {
     fn as_mut(&mut self) -> &mut Self {
         self
     }
 }
 
-impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
+impl MapObserver for FuzzilliCoverageObserver {
     type Entry = u8;
 
     fn get(&self, idx: usize) -> Self::Entry {
@@ -106,18 +147,15 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
     }
 
     fn usable_count(&self) -> usize {
-        self.num_edges // Each bit represents an edge
+        self.num_edges
     }
 
     fn count_bytes(&self) -> u64 {
-        self.map[4..(4 + (self.num_edges / 8))]
-            .iter()
-            .map(|&byte| byte.count_ones() as u64)
-            .sum()
+        self.map.iter().map(|&byte| byte.count_ones() as u64).sum()
     }
 
     fn reset_map(&mut self) -> Result<(), libafl::Error> {
-        self.map[4..(4 + (self.num_edges / 8))].fill(0);
+        self.map.fill(0);
         Ok(())
     }
 
@@ -138,12 +176,12 @@ impl<'a> MapObserver for FuzzilliCoverageObserver<'a> {
     }
 }
 
-/// Updates the corpus by adding new inputs from the directory while avoiding duplicates.
 fn update_corpus(
     corpus_dir: &str,
     corpus: &mut InMemoryCorpus<BytesInput>,
     seen_inputs: &mut HashMap<Vec<u8>, bool>,
-) {
+) -> Vec<CorpusId> {
+    let mut corpus_ids = Vec::new();
     let entries = fs::read_dir(corpus_dir).expect("Failed to read input corpus directory");
 
     for entry in entries {
@@ -161,12 +199,29 @@ fn update_corpus(
             if !seen_inputs.contains_key(&bytes) {
                 let input = BytesInput::new(bytes.clone());
                 let testcase = Testcase::new(input);
-                corpus.add(testcase).expect("Failed to add testcase to corpus");
+
+                // Add testcase to the corpus and get the corpus ID
+                let idx = corpus.add(testcase).unwrap();
+                corpus_ids.push(idx);
                 seen_inputs.insert(bytes, true);
                 println!("Added new input from {:?}", path);
             }
         }
     }
+
+    corpus_ids
+}
+
+fn update_scheduler(
+    scheduler: &mut ProbabilitySamplingScheduler<UniformDistribution>,
+    state: &mut StdState<InMemoryCorpus<BytesInput>, BytesInput, RomuDuoJrRand, InMemoryCorpus<BytesInput>>,
+    corpus_ids: Vec<CorpusId>,
+) {
+    for idx in corpus_ids {
+        println!("Adding testcase ID: {:?}", idx);
+        scheduler.on_add(state.borrow_mut(), idx).unwrap();
+    }
+
 }
 
 fn main() {
@@ -184,18 +239,18 @@ fn main() {
         .shmem_from_id_and_size(shmem_id, 0x200000)
         .expect("Failed to attach to shared memory");
 
-    let mut shared_mem_clone = shmem.as_slice_mut().to_vec(); // Clone to avoid borrow conflicts
+    let mut shared_mem_clone = shmem.as_slice().to_vec(); // Clone to avoid borrow conflicts
 
-    let observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shmem.as_slice_mut()).track_indices();
+    let raw_observer = FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_clone.clone());
+    let observer = raw_observer.track_indices();
 
     let mut feedback = MaxMapFeedback::new(&observer);
     let mut objective_feedback = MaxMapFeedback::new(&observer);
 
-    let corpus_dir = "../fuzzilli/pcorpus";
+    let corpus_dir = "../fuzzilli/sm_qss_out/pcorpus";
     let mut input_corpus = InMemoryCorpus::new();
     let mut seen_inputs: HashMap<Vec<u8>, bool> = HashMap::new();
-
-    update_corpus(corpus_dir, &mut input_corpus, &mut seen_inputs);
+    let corpus_ids = update_corpus(corpus_dir, &mut input_corpus, &mut seen_inputs);
     println!("Loaded {} inputs into the in-memory corpus.", input_corpus.count());
 
     let rng = RomuDuoJrRand::with_seed(12345);
@@ -209,64 +264,46 @@ fn main() {
     )
     .expect("Failed to create state");
 
-    if shared_mem_clone.len() < 4 {
-        panic!("Shared memory region is too small to contain header.");
-    }
-    
-    let num_edges = u32::from_le_bytes(shared_mem_clone[0..4].try_into().unwrap()) as usize;
-    println!("Number of edges in shared memory: {}", num_edges);
-    let coverage_data = &shared_mem_clone[4..];
-    
-    if coverage_data.len() < num_edges {
-        panic!("Shared memory does not contain enough coverage data for the declared number of edges.");
-    }
-    
-    let accounting_map: Vec<u32> = coverage_data
-        .iter()
-        .take(num_edges)
-        .map(|&byte| byte as u32)
-        .collect();
+    println!("State created successfully!");
+    state.metadata_map_mut().insert(FuzzilliCoverageObserver::new("fuzzilli_coverage", shared_mem_clone.clone()));
 
-    let mut scheduler = CoverageAccountingScheduler::new(&observer, &mut state, QueueScheduler::new(), &accounting_map);
+    let mut scheduler = UniformProbabilitySamplingScheduler::new();
+
+    update_scheduler(&mut scheduler, &mut state, corpus_ids);
 
     println!("Starting input suggestion loop...");
     loop {
-        update_corpus(corpus_dir, state.corpus_mut(), &mut seen_inputs);
+        // let corpus_ids = update_corpus(corpus_dir, &mut input_corpus.clone(), &mut seen_inputs);
+        // update_scheduler(&mut scheduler, &mut state, corpus_ids);
 
-        let raw_observer = observer.as_ref();
-        let map = &raw_observer.map;
-        let total_entries = map.len();
-        let total_non_zero: usize = map.iter().filter(|&&x| x > 0).count();
-        let max_value = map.iter().max().unwrap_or(&0);
-
-        println!("\n=== Fuzzilli Shared Memory Coverage ===");
-        // println!("Non-Zero Entries (Covered): {}", total_non_zero);
-        // println!("Max Value (Hit Count): {}", max_value);
-        println!("Observer (First 512 Bytes): {:?}", &map[..512]);
-        println!("Corpus size: {}", state.corpus().count());
-        println!("Number of edges in shared memory: {}", num_edges);
-
-        println!("Shared memory contents (first 128 bytes as bits):");
-        for byte in &shared_mem_clone[..128.min(shared_mem_clone.len())] {
-            print!("{:08b} ", byte);
+        // Debug: Ensure corpus is not empty before calling scheduler
+        if state.corpus().count() == 0 {
+            println!("Corpus is unexpectedly empty!");
+        } else {
+            println!("Corpus contains {} entries", state.corpus().count());
         }
-        println!();
-        // println!("Accounting Map: {:?}", &accounting_map[..256]);
+
+        if state.corpus().count() == 0 {
+            println!("Corpus is empty! No inputs to schedule.");
+            continue;
+        }
+
+        let meta = state.metadata_map().get::<ProbabilityMetadata>().unwrap();
+        if meta.map.is_empty() {
+            println!("ProbabilityMetadata is empty!");
+        } else {
+            println!("ProbabilityMetadata has {} keys", meta.map.len());
+        }
+
+        println!("Metadata map contents: {:?}", state.metadata_map().len());
         match scheduler.next(&mut state) {
             Ok(next_id) => {
-                println!("Scheduler selected input ID: {:?}", next_id);
-
-                let next_testcase = state.corpus().get(next_id).unwrap();
-                let next_input = next_testcase.borrow();
-                let input_bytes = next_input.input().as_ref().unwrap();
-
-                println!("Next input: {:?}", input_bytes.target_bytes());
+                println!("Scheduled testcase ID: {:?}", next_id);
+                thread::sleep(Duration::from_millis(100));
             }
             Err(err) => {
-                println!("Scheduler error: {:?}", err);
+                println!("Error while scheduling testcase: {:?}", err);
             }
         }
-
-        thread::sleep(Duration::from_secs(5));
     }
 }
